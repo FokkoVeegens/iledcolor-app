@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { checkDecodedLimits, checkFileLimits, fitRect } from '../src/render/image';
 import { cornerTest, rgbaToRgb, solid, transformImage } from '../src/render/matrix';
-import { DEFAULT_SETTINGS, exportJson, parseImport, type Preset } from '../src/storage/presets';
+import { DEFAULT_SETTINGS, exportJson, isGroupPreset, parseImport, type Preset } from '../src/storage/presets';
+import { DEFAULT_APPROACH } from '../src/approach/tiers';
 
 const px = (img: { width: number; pixels: Uint8Array }, x: number, y: number) =>
   Array.from(img.pixels.subarray((y * img.width + x) * 3, (y * img.width + x) * 3 + 3));
@@ -57,6 +58,7 @@ describe('preset import/export', () => {
     const out = parseImport(exportJson(DEFAULT_SETTINGS, [preset]));
     expect(out.presets).toEqual([preset]);
     expect(out.settings).toEqual(DEFAULT_SETTINGS);
+    expect(out.qrProfiles).toEqual({ selectedId: null, profiles: [] });
   });
   const good = JSON.parse(exportJson(DEFAULT_SETTINGS, [preset]));
   const bad = (mut: (o: any) => void) => { const o = structuredClone(good); mut(o); return JSON.stringify(o); };
@@ -72,10 +74,57 @@ describe('preset import/export', () => {
     expect(() => parseImport(bad((o) => { o.presets[0] = { ...o.presets[0], content: { kind: 'image', dataUrl: 'http://x/y.png', fit: 'cover', bg: '#000000' } }; }))).toThrow();
   });
   it('rejects oversized input', () => expect(() => parseImport('x'.repeat(5 * 1024 * 1024))).toThrow(/too large/));
+  it('round-trips QR profiles in the app backup and accepts older backups without them', () => {
+    const qrProfiles = {
+      selectedId: '1',
+      profiles: [{
+        id: '1', note: 'MS AI Tour',
+        pattern: String.raw`^[^^]*\^(?<firstname>[^^]+)\^(?<lastname>[^^]+)\^(?<company>[^^]+)\^`,
+        template: 'Hello {firstname} {lastname} from {company}!',
+      }],
+    };
+    expect(parseImport(exportJson(DEFAULT_SETTINGS, [preset], qrProfiles)).qrProfiles).toEqual(qrProfiles);
+    const legacy = JSON.parse(exportJson(DEFAULT_SETTINGS, [preset]));
+    delete legacy.qrProfiles;
+    expect(parseImport(JSON.stringify(legacy)).qrProfiles).toEqual({ selectedId: null, profiles: [] });
+    const malformed = JSON.parse(exportJson(DEFAULT_SETTINGS, [preset], qrProfiles));
+    malformed.qrProfiles.profiles.push(qrProfiles.profiles[0]);
+    expect(() => parseImport(JSON.stringify(malformed))).toThrow(/slots must be unique/);
+  });
+
+  const groupPreset: Preset = { id: 'g1', name: 'Party', updatedAt: 2, groups: structuredClone(DEFAULT_APPROACH.tiers) };
+  it('round-trips group content presets next to content presets', () => {
+    const out = parseImport(exportJson(DEFAULT_SETTINGS, [preset, groupPreset]));
+    expect(out.presets).toEqual([preset, groupPreset]);
+    expect(isGroupPreset(out.presets[1]!)).toBe(true);
+    expect(isGroupPreset(out.presets[0]!)).toBe(false);
+  });
+  it('round-trips the solo Create option and rejects invalid sources', () => {
+    const p = { id: 'create-solo', name: 'Create solo', updatedAt: 3, groups: structuredClone(DEFAULT_APPROACH.tiers) };
+    p.groups.solo.useCreate = true;
+    expect(parseImport(exportJson(DEFAULT_SETTINGS, [p])).presets).toEqual([p]);
+    const raw = JSON.parse(exportJson(DEFAULT_SETTINGS, [p]));
+    raw.presets[0].groups.solo.useCreate = 'yes';
+    expect(() => parseImport(JSON.stringify(raw))).toThrow(/useCreate/);
+    raw.presets[0].groups.solo.useCreate = true;
+    raw.presets[0].groups.pair.useCreate = true;
+    expect(() => parseImport(JSON.stringify(raw))).toThrow(/useCreate/);
+  });
+  it('rejects malformed group content', () => {
+    const g = JSON.parse(exportJson(DEFAULT_SETTINGS, [groupPreset]));
+    const badG = (mut: (o: any) => void) => { const o = structuredClone(g); mut(o); return JSON.stringify(o); };
+    expect(() => parseImport(badG((o) => { delete o.presets[0].groups.pair; }))).toThrow(/Preset 1: missing group pair/);
+    expect(() => parseImport(badG((o) => { o.presets[0].groups.solo.mode = 'blink'; }))).toThrow(/mode/);
+    expect(() => parseImport(badG((o) => { o.presets[0].groups.upTo4.fg = 'red'; }))).toThrow(/fg/);
+    expect(() => parseImport(badG((o) => { o.presets[0].groups.upTo8.speed = 11; }))).toThrow(/speed/);
+    expect(() => parseImport(badG((o) => { o.presets[0].groups.moreThan8.text = 'x'.repeat(121); }))).toThrow(/text/);
+    expect(() => parseImport(badG((o) => { o.presets[0].content = { kind: 'solid', color: '#000000' }; }))).toThrow(/both/);
+  });
 });
 
 import { encodeGif } from '../src/render/gif';
 import { buildGifStream } from '../src/protocol/framing';
+import { crc32c } from '../src/protocol/crc32c';
 
 describe('gif marquee', () => {
   const frame = (on: number) => {
@@ -94,6 +143,24 @@ describe('gif marquee', () => {
 });
 
 describe('gif encoder extras', () => {
+  it('nonce changes the bytes only in unused palette entries', () => {
+    const f = (on: number) => {
+      const pixels = new Uint8Array(32 * 16 * 3);
+      pixels.set([255, 208, 0], on * 3);
+      return { width: 32, height: 16, pixels };
+    };
+    const frames = [f(0), f(7)];
+    const a = encodeGif(frames, 40, { nonce: Uint8Array.of(1, 2, 3, 4, 5, 6) });
+    const b = encodeGif(frames, 40, { nonce: Uint8Array.of(9, 8, 7, 6, 5, 4) });
+    expect(a.length).toBe(b.length);
+    const diff = [...a.keys()].filter((i) => a[i] !== b[i]);
+    // Header(13) + 2 used colours (6 bytes): the nonce lives at bytes 19..24 of the 4-entry table.
+    expect(a[10]! & 7).toBe(1);
+    expect(Math.min(...diff)).toBeGreaterThanOrEqual(19);
+    expect(Math.max(...diff)).toBeLessThan(25);
+    expect([...a.subarray(13, 19)]).toEqual([255, 208, 0, 0, 0, 0]);
+    expect(crc32c(a)).not.toBe(crc32c(b));
+  });
   it('quantizes frames with more than 256 colours and accepts per-frame delays', () => {
     const pixels = new Uint8Array(32 * 16 * 3);
     for (let i = 0; i < pixels.length; i++) pixels[i] = (i * 37) & 255;

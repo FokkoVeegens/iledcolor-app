@@ -3,11 +3,21 @@ import {
   buildGifStream, buildImageStream, buildStartStream, buildTestPass, parseNotification, type RgbImage,
 } from '../protocol/framing';
 import { SelectionCancelledError, SPIKE_PROFILE, type Transport, type TransportProfile } from '../transport/types';
+import { renewGif } from '../render/gif';
+
+type DisplayContent =
+  | { image: RgbImage }
+  | { gif: Uint8Array; width: number; height: number; still?: RgbImage };
 
 export type DeviceState =
   | 'Disconnected' | 'Selecting' | 'Connecting' | 'Handshaking' | 'Ready' | 'Uploading' | 'Error';
 
 export type UploadResult = 'confirmed' | 'sent-unconfirmed';
+
+export interface UploadOptions {
+  /** Awaited after the last chunk, right before EndStream (which starts playback), e.g. to align caps. */
+  beforeEnd?: () => Promise<void>;
+}
 
 export interface Timeouts { handshakeMs: number; startMs: number; chunkMs: number; endMs: number; controlMs: number }
 export const DEFAULT_TIMEOUTS: Timeouts = { handshakeMs: 2000, startMs: 2000, chunkMs: 500, endMs: 1000, controlMs: 500 };
@@ -46,6 +56,9 @@ export class DeviceController {
   private listeners = new Set<() => void>();
   /** Bumped on every connect/disconnect so stale async work can detect it. */
   private epoch = 0;
+  private displayed?: DisplayContent;
+  private temporary = false;
+  private displayEnabled?: boolean;
   readonly profile: TransportProfile;
   readonly timeouts: Timeouts;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -61,6 +74,8 @@ export class DeviceController {
 
   get state() { return this._state; }
   get error() { return this._error; }
+  get temporaryActive() { return this.temporary; }
+  get canRestoreContent() { return !!this.displayed; }
   subscribe(cb: () => void) { this.listeners.add(cb); return () => this.listeners.delete(cb); }
 
   private setState(s: DeviceState, error: string | null = null) {
@@ -124,6 +139,8 @@ export class DeviceController {
 
   /** Cancel waits/writes and clear notification state. Unsent artwork lives in the UI. */
   private teardown() {
+    this.displayed = undefined;
+    this.displayEnabled = undefined;
     this.unsubs.forEach((u) => u());
     this.unsubs = [];
     this.transport = null;
@@ -151,54 +168,131 @@ export class DeviceController {
   }
 
   async upload(img: RgbImage): Promise<UploadResult> {
-    return this.uploadStream(buildImageStream(img, this.profile.maxStreamBytes));
+    return this.sendContent({ image: structuredClone(img) });
   }
 
-  /** Looping GIF (e.g. a scrolling marquee) played by the hat itself. */
-  async uploadGif(gif: Uint8Array, width: number, height: number): Promise<UploadResult> {
-    return this.uploadStream(buildGifStream(gif, width, height, this.profile.maxStreamBytes));
+  /**
+   * Looping GIF (e.g. a scrolling marquee) played by the hat itself. `still` (normally the first
+   * frame) is sent first as a static image: replacing a running animation directly can leave the
+   * old playback running alongside the new one on the hat, which then plays visibly faster.
+   */
+  async uploadGif(gif: Uint8Array, width: number, height: number, still?: RgbImage, opts: UploadOptions = {}): Promise<UploadResult> {
+    return this.sendContent({ gif: gif.slice(), width, height, still: still && structuredClone(still) }, opts);
   }
 
-  private async uploadStream({ bytes, crc }: { bytes: Uint8Array; crc: number }): Promise<UploadResult> {
+  private sendContent(content: DisplayContent, opts: UploadOptions = {}, immediate = false): Promise<UploadResult> {
+    const streams = 'image' in content
+      ? [buildImageStream(content.image, this.profile.maxStreamBytes)]
+      : [
+        ...(content.still ? [buildImageStream(content.still, this.profile.maxStreamBytes)] : []),
+        buildGifStream(content.gif, content.width, content.height, this.profile.maxStreamBytes),
+      ];
+    return this.uploadStreams(streams, content, opts, immediate);
+  }
+
+  /** Holds the operation queue through playback and restoration; other caps have independent queues. */
+  async playTemporary(gif: Uint8Array, still: RgbImage, durationMs: number): Promise<'completed' | 'cancelled'> {
+    if (this.temporary) throw new DeviceError('A greeting is already playing', 'busy');
+    if (this.state !== 'Ready') throw new DeviceError('Connect the primary cap first', 'disconnected');
+    if (!this.displayed) throw new DeviceError('Send content to the cap first so it can be restored after the greeting', 'invalid');
+    if (!Number.isFinite(durationMs) || durationMs <= 0) throw new DeviceError('Invalid greeting duration', 'invalid');
+    const greeting = { gif: gif.slice(), width: still.width, height: still.height, still: structuredClone(still) };
+    // Validate before taking the queue or changing the display.
+    buildGifStream(greeting.gif, greeting.width, greeting.height, this.profile.maxStreamBytes);
+    const epoch = this.epoch;
+    this.temporary = true;
+    this.listeners.forEach((cb) => cb());
+    try {
+      return await this.exclusive(async () => {
+        if (epoch !== this.epoch) throw new DeviceError('Connection changed before greeting', 'disconnected');
+        const previous = this.displayed;
+        if (!previous) throw new DeviceError('Previous content is no longer available', 'disconnected');
+        const restored = 'gif' in previous ? { ...previous, gif: renewGif(previous.gif), still: previous.still ?? greeting.still } : previous;
+        if ('gif' in restored) buildGifStream(restored.gif, restored.width, restored.height, this.profile.maxStreamBytes);
+        const wasOff = this.displayEnabled === false;
+        let playbackError: unknown;
+        try {
+          if (await this.sendContent(greeting, {}, true) !== 'confirmed')
+            throw new DeviceError('Greeting upload was not confirmed', 'protocol');
+          if (wasOff) await this.request(buildDisplayEnable(true), 'cmd', Cmd.DISPLAY_ENABLE, this.timeouts.controlMs);
+          const deadline = Date.now() + durationMs;
+          while (Date.now() < deadline) {
+            this.checkCancel(epoch);
+            await this.sleep(Math.min(100, deadline - Date.now()));
+          }
+          this.checkCancel(epoch);
+        } catch (e) { playbackError = e; }
+        if (epoch !== this.epoch) throw new DeviceError(`Previous content could not be restored: ${errMsg(playbackError ?? 'connection lost')}. Reconnect and send it again.`, 'disconnected');
+        let displayError: unknown;
+        if (wasOff) {
+          try { await this.request(buildDisplayEnable(false), 'cmd', Cmd.DISPLAY_ENABLE, this.timeouts.controlMs); }
+          catch (e) { displayError = e; }
+        }
+        if (await this.sendContent(restored, {}, true) !== 'confirmed')
+          throw new DeviceError('Previous content was sent, but restoration was not confirmed', 'protocol');
+        this.displayed = previous;
+        if (displayError) throw new DeviceError(`Content restored, but display-off could not be confirmed: ${errMsg(displayError)}`, 'protocol');
+        if (playbackError instanceof DeviceError && playbackError.kind === 'cancelled') return 'cancelled' as const;
+        if (playbackError) throw playbackError;
+        return 'completed' as const;
+      });
+    } finally {
+      this.temporary = false;
+      this.listeners.forEach((cb) => cb());
+    }
+  }
+
+  private async uploadStreams(streams: { bytes: Uint8Array; crc: number }[], content: DisplayContent, opts: UploadOptions = {}, immediate = false): Promise<UploadResult> {
     // Validate everything before any BLE write.
-    const frames = buildContinueFrames(bytes, this.profile.chunkSize);
-    const start = buildStartStream(crc, bytes.length);
+    const parts = streams.map(({ bytes, crc }) => ({
+      start: buildStartStream(crc, bytes.length),
+      frames: buildContinueFrames(bytes, this.profile.chunkSize),
+    }));
     const end = buildEndStream();
+    const total = parts.reduce((n, p) => n + p.frames.length, 0);
 
-    return this.exclusive(async () => {
+    const run = async () => {
       if (this._state !== 'Ready') throw new DeviceError('Not connected', 'disconnected');
       const epoch = this.epoch;
       this.cancelled = false;
       this.setState('Uploading');
-      this.progress = { sent: 0, total: frames.length };
+      this.progress = { sent: 0, total };
       this.listeners.forEach((cb) => cb());
       let result: UploadResult = 'confirmed';
+      let sent = 0;
       try {
-        await this.request(start, 'cmd', Cmd.START_STREAM, this.timeouts.startMs);
-        for (let seq = 0; seq < frames.length; seq++) {
+        for (const [index, { start, frames }] of parts.entries()) {
           this.checkCancel(epoch);
-          const frame = frames[seq]!;
-          try {
-            await this.request(frame, 'data', Cmd.CONTINUE, this.timeouts.chunkMs, (body) => {
-              // If the ack echoes a sequence number (first 4 bytes), it must be ours.
-              if (body.length >= 4) {
-                const got = ((body[0]! << 24) | (body[1]! << 16) | (body[2]! << 8) | body[3]!) >>> 0;
-                if (got !== seq) throw new DeviceError(`Ack for chunk ${got}, expected ${seq}`, 'protocol');
-              }
-              // Observed hat ack: seq(4) + status(1), status 0x01 = accepted.
-              if (body.length >= 5 && body[4] !== 0x01)
-                throw new DeviceError(`Chunk ${seq} rejected (status 0x${body[4]!.toString(16)})`, 'protocol');
-            });
-          } catch (e) {
-            if (e instanceof DeviceError && e.kind === 'timeout' && this.profile.allowMissingChunkAcks) {
-              result = 'sent-unconfirmed';
-            } else throw e;
+          await this.request(start, 'cmd', Cmd.START_STREAM, this.timeouts.startMs);
+          for (let seq = 0; seq < frames.length; seq++) {
+            this.checkCancel(epoch);
+            const frame = frames[seq]!;
+            try {
+              await this.request(frame, 'data', Cmd.CONTINUE, this.timeouts.chunkMs, (body) => {
+                // If the ack echoes a sequence number (first 4 bytes), it must be ours.
+                if (body.length >= 4) {
+                  const got = ((body[0]! << 24) | (body[1]! << 16) | (body[2]! << 8) | body[3]!) >>> 0;
+                  if (got !== seq) throw new DeviceError(`Ack for chunk ${got}, expected ${seq}`, 'protocol');
+                }
+                // Observed hat ack: seq(4) + status(1), status 0x01 = accepted.
+                if (body.length >= 5 && body[4] !== 0x01)
+                  throw new DeviceError(`Chunk ${seq} rejected (status 0x${body[4]!.toString(16)})`, 'protocol');
+              });
+            } catch (e) {
+              if (e instanceof DeviceError && e.kind === 'timeout' && this.profile.allowMissingChunkAcks) {
+                result = 'sent-unconfirmed';
+              } else throw e;
+            }
+            this.progress = { sent: ++sent, total };
+            this.listeners.forEach((cb) => cb());
           }
-          this.progress = { sent: seq + 1, total: frames.length };
-          this.listeners.forEach((cb) => cb());
+          this.checkCancel(epoch);
+          if (index === parts.length - 1 && opts.beforeEnd) {
+            await opts.beforeEnd();
+            this.checkCancel(epoch);
+          }
+          await this.request(end, 'data', Cmd.END_STREAM, this.timeouts.endMs);
         }
-        this.checkCancel(epoch);
-        await this.request(end, 'data', Cmd.END_STREAM, this.timeouts.endMs);
       } catch (e) {
         this.trace('ev', 'upload failed: ' + errMsg(e));
         if (epoch === this.epoch) {
@@ -212,9 +306,10 @@ export class DeviceController {
         }
         throw e;
       }
-      if (epoch === this.epoch) { this.progress = null; this.setState('Ready'); }
+      if (epoch === this.epoch) { this.displayed = result === 'confirmed' ? content : undefined; this.progress = null; this.setState('Ready'); }
       return result;
-    });
+    };
+    return immediate ? run() : this.exclusive(run);
   }
 
   cancelUpload() { this.cancelled = true; }
@@ -230,7 +325,10 @@ export class DeviceController {
   }
 
   async setDisplay(on: boolean): Promise<UploadResult> {
-    return this.control(buildDisplayEnable(on), Cmd.DISPLAY_ENABLE);
+    const epoch = this.epoch;
+    const result = await this.control(buildDisplayEnable(on), Cmd.DISPLAY_ENABLE);
+    if (result === 'confirmed' && epoch === this.epoch) this.displayEnabled = on;
+    return result;
   }
 
   /** 'sent-unconfirmed' means written but no ack: the UI must show it as pending, not applied. */
