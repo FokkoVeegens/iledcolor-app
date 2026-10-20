@@ -2,19 +2,27 @@
 
 ## App navigation
 
-The native apps have four icon tabs: **Connect**, **Approach**, **Scan**, and
-**Settings** (the gear icon at the far right). The web app has **Connect**, **Scan**
+The native apps have five icon tabs: **Connect**, **Approach**, **Scan**, **Sound**, and
+**Settings** (the gear icon at the far right). The web app has **Connect**, **Scan**, **Sound**
 and **Settings**; native-only Approach detection is not offered in the browser.
 The same source supplies the content editor, scan-first layout, settings, accessible
 tab navigation and responsive controls on Android, iOS and web.
 
 - **Connect:** connect/disconnect your primary cap, then create text, solid colours,
   images or GIFs, preview and send them, or save a content preset. There is no separate Create tab.
+  Under **Sequence**, add the current content or saved presets as steps (up to 20), set how
+  many seconds each step shows (animations play whole cycles for at least that long), reorder
+  or remove steps, and turn on **Play sequence** to preview, send or save all steps as one
+  looping animation. Pausing keeps the steps as a draft. Sequence presets can be shared with
+  nearby phones running a version that supports sequences. Long holds between GIF frames still
+  need verification on the physical hat.
 - **Approach:** configure greetings and group content, compare nearby texts, calibrate
   detection and record/replay walks. Every spanning **Marquee** choice is marked **unstable**:
   physical cap ordering and playback synchronization are not guaranteed. Individual greetings remain available.
 - **Scan:** the scan/stop/end-greeting actions, camera and status come first, followed by
   the profile selector, QR profile editor, greeting settings, manual entry, and scan-log/privacy controls.
+- **Sound:** opt-in applause/whistle detection, wearer voice sampling, English/German
+  phrase reactions, pocket-pause settings, dictionary and editable animation text.
 - **Settings:** saved presets and category-based sharing/import, then display brightness/on/off,
   expandable test patterns and protocol log, and rotation/mirroring/transport settings.
   Loading a content preset opens Connect; loading a group preset opens Approach.
@@ -35,7 +43,130 @@ and backup/import remain available without Bluetooth. Camera scanning requires H
 and permission. Imported native group presets are retained and can be exported again,
 but cannot be loaded in the browser. Nearby BLE sharing is native-only; JSON file
 sharing/download remains available on web. The `#mock` development mode deliberately
-keeps all four tabs for simulated Approach scenarios.
+keeps all five tabs for simulated Approach scenarios.
+
+## Web app regression tests
+
+Tab navigation is wired before Scan and Sound restore their settings, so a slow
+optional feature cannot leave all tabs unresponsive. Vitest tests the actual HTML
+tab shell (selection, associated panels, hidden/native tabs, invalid targets and
+keyboard focus). Playwright also reproduces stalled Scan/Sound initialization.
+
+Run unit tests and the complete local browser suite against a production build:
+
+```powershell
+npm ci
+npx playwright install chromium firefox webkit
+npm test
+npm run e2e
+```
+
+The existing hardware-mock/offline tests run in Chromium. Permission-free web
+navigation smoke tests run in Chromium, Firefox and WebKit, with desktop/mobile
+viewports, every visible tab, keyboard wrapping, reload and content retention
+while switching tabs. They do not connect a cap or request camera/microphone access.
+
+To run the same smoke tests against the deployed app, including its subdirectory:
+
+```powershell
+$env:PLAYWRIGHT_BASE_URL = 'https://harrybin.de/iledcolor-app-native-added/'
+npm run e2e:smoke
+Remove-Item Env:\PLAYWRIGHT_BASE_URL
+```
+
+With `PLAYWRIGHT_BASE_URL` set, Playwright does not start a local server and runs
+only the remote-safe navigation suite. Relative test URLs preserve the app's base
+path rather than navigating to the host's root.
+
+The **Web app tests** GitHub Actions workflow runs unit/local browser tests on
+pull requests and main pushes. It checks the deployed URL daily, after a successful
+Pages deployment workflow when `PAGES_ENABLED` is enabled, and through **Run
+workflow**, where `base_url` can target another deployment. Failures retain HTML
+reports, screenshots and browser traces for 14 days. Scheduled runs use the default
+branch's workflow; these checks become active once the workflow is merged.
+
+## Native unit tests
+
+Pure Android/iOS plugin rules (update URL/checksum/version policy, approach beacon
+content/read/write/name rules, motion math, sound language/PCM/downsampling and
+proximity) live in framework-free helpers that the plugins call, so they run
+without a device. Android uses JUnit in `android/app/src/test`; iOS uses XCTest in
+the `ios/NativeRules` Swift package, whose `NativeRules.swift` is also compiled into
+the App target. Android needs JDK 21, the Android SDK and a prior Capacitor sync:
+
+```powershell
+npm run build
+npx cap sync android
+cd android
+.\gradlew.bat testDebugUnitTest
+```
+
+On macOS (or Linux with Swift 5.9+), run the iOS rules tests without Xcode:
+
+```powershell
+swift test --package-path ios/NativeRules
+```
+
+The **Native unit tests** workflow runs both on pull requests and main pushes. Real
+Bluetooth, microphone, speech, installer and share-sheet behaviour still requires
+physical devices; see [docs/test-coverage.md](docs/test-coverage.md).
+
+## Sound and voice reactions
+
+**Sound** is available on Android, iOS and web. Connect the primary cap and send
+content first, then tap **Start listening**. Applause and whistles trigger coloured
+scrolling-text GIF animations on that cap only. Phrase categories cover greetings,
+farewells, approval, food, thanks, questions, coffee breaks and celebrations.
+Each category can be disabled and its animation text edited; **Preview animation**
+works offline without a microphone or cap, and **Test on cap** exercises playback
+and restoration without listening. Reactions use the existing temporary-content
+controller, restore the previous content, skip busy/QR-greeting periods and apply
+a 10-second cooldown. **End reaction** restores early. Firmware playback timing
+and physical display behaviour still require real-cap verification.
+
+Phrases are off by default. First record a **12-second voice sample** in a quiet
+place, then enable phrases and select **English** or **Deutsch** for the conversation.
+The editable reaction list includes a built-in bilingual dictionary, including
+“hello / guten Morgen”, “bye / tschüss”, “awesome / toll”, “food / Frühstück”
+and conference phrases. Matching uses whole words and prefers longer phrases.
+The recognizer listens in one selected language at a time; it does not switch
+languages automatically.
+
+The local **experimental wearer filter** compares pitch and acoustic cepstral
+features throughout the recognized utterance with the saved sample. Missing audio,
+insufficient clear speech or a mismatch rejects the phrase; a match from an earlier,
+unrelated utterance is not enough. This is **not a trained speaker-embedding model,
+biometric authentication or a guarantee of wearer-only activation**. Similar voices,
+replays, microphone position and conference noise can cause false acceptance or
+rejection. Applause and whistle recognition is likewise a conservative acoustic
+heuristic, not a trained sound-event classifier; music, beeps and other noise may
+trigger it. Other people's applause intentionally does not need a wearer match.
+
+| Platform | Audio and speech | Pocket detection |
+| --- | --- | --- |
+| Android | App-local `SoundDetection` plugin captures mono PCM. Phrase recognition requires Android 13+, a compatible on-device speech service, and an installed model for the chosen language; older/unsupported devices can use room sounds and voice sampling. No minimum-SDK increase. | Optional hardware proximity sensor; unavailable sensors are reported. |
+| iOS | App-local `SoundDetection` plugin uses AVAudioEngine and on-device-only Speech recognition. Microphone and, for phrases, speech permissions are required. Unsupported/unavailable language models reject speech startup rather than using server recognition. | UIDevice proximity monitoring on supported devices; commonly unavailable on iPads. |
+| Web/PWA | HTTPS/localhost, Web Audio/AudioWorklet and microphone permission are required. Speech also requires browser SpeechRecognition support and explicit **Allow browser speech recognition** consent: the browser provider may process audio remotely and require internet. Sound detection and voice sampling are local. | Not available: browsers do not expose a reliable proximity sensor here. Automatic pocket pause is disabled, not simulated. |
+
+**Pause recognition while the phone is in a pocket** is on by default where a
+sensor exists. A covered sensor lasting at least 500 ms pauses sound analysis
+and phrase reactions; uncovering clears stale audio and resumes them. Microphone
+capture remains active while paused. With the option off, a covered-sensor warning
+explains that muffling may reduce accuracy. Proximity is only an indication:
+a hand or nearby object can cover it too.
+
+Listening stops when leaving Sound, hiding/locking the app, losing microphone
+access, or tapping Stop. There is no background recording service or background
+entitlement. Keep the app foregrounded through cap playback/restoration.
+The app persists only sound settings and a local acoustic voice template, not raw
+audio or transcripts. **Delete voice sample** removes the template; audio buffers
+are cleared when stopped. Sound settings can be included in backups (Settings →
+Backup → **Sound settings**); the voice template and the browser speech permission
+are never exported. Browser speech-provider privacy policies apply if that service is enabled.
+Native plugins are registered directly in MainActivity/AppViewController, so they
+do not appear as npm plugins in `cap ls`; rebuild the native app after synchronizing.
+Native permissions, language-service support, proximity screen-off behaviour and
+speaker/noise accuracy must still be verified on physical phones.
 
 ### App icons
 
@@ -69,11 +200,23 @@ when sensors are unavailable. These sensors cannot locate other caps, so physica
 uses manual local cap order and deterministic phone-ID order across phones.
 
 In **Settings → Backup**, choose what to include before tapping **Share presets**:
-**Creations** (saved text, colors, images and GIFs), **Approach settings** (saved group presets
-and current group content), and **Scan settings** (proximity thresholds, timing and QR greeting profiles).
+**Creations** (saved text, colors, images, GIFs and sequences plus current Connect content
+and sequence steps, including a paused sequence draft),
+**Approach settings** (saved group presets, current group content, mode, beacon and nearby-cap detection),
+**Scan settings** (proximity thresholds, timing, QR profiles, current greeting/regex,
+repetitions, speed and scan-logging preference), **Display & transport settings**
+(dimensions, brightness, rotation, mirroring and Bluetooth write settings), and
+**Sound settings** (room sounds, phrases, language, pocket pause, enabled reactions and
+their cap texts). Importing Sound settings stops active listening; the voice sample and
+the browser speech permission stay on each device, so record a voice sample on the
+receiving phone before using phrases.
 The system share sheet sends a JSON file. Import replaces only the included categories,
-keeping excluded presets, phone identity, cap connections and device settings unchanged.
-Older full JSON backups remain importable with their original full-replacement behavior.
+keeping excluded presets and settings unchanged. Importing Scan settings can enable
+local scan logging; log contents and scanned QR payloads are never included. Phone
+identity, cap connections, permissions and live running state are not shared.
+Older version-2 files keep newer settings they do not contain. Older full JSON backups
+remain importable with their original full-replacement behavior. Reconnect after importing
+transport settings to apply the new write profile.
 
 ## QR badge greetings
 
@@ -156,6 +299,25 @@ TestFlight distribution are not part of this workflow. BLE needs a physical devi
 The IPA embeds the provisioning profile, including registered device UDIDs; anyone with download
 access can inspect it. Account for this before publishing Ad Hoc builds in a public repository.
 
+### In-app update check
+
+The Android and iOS apps check [GitHub Releases](https://github.com/harrybin/iledcolor-app-native-added/releases)
+a few seconds after startup (at most every 6 hours, anonymously via the GitHub API) and show an
+**Update** banner when a newer published, non-prerelease version contains an asset for the
+platform. **Settings > App updates** shows the installed version and offers a manual check.
+Installation never starts during a cap upload or temporary display.
+
+- **Android** downloads `led-hat-vX.Y.Z-android.apk`, verifies it against
+  `SHA256SUMS-android.txt`, checks that it is a newer build of `com.harrybin.ledhat`, then opens
+  the system installer. Android always asks for confirmation; on first use it opens the
+  *Install unknown apps* setting for LED Hat. Updates install only when signed with the same key.
+- **iOS** opens the over-the-air installer (`itms-services`) using `led-hat-vX.Y.Z-ios.plist`,
+  which the iOS release workflow publishes next to the IPA. Only devices registered in the Ad Hoc
+  profile can install it; older releases without the manifest are not offered.
+- The browser PWA keeps updating through its service worker and does not query GitHub.
+
+No setting is stored for this feature, so backups are unaffected.
+
 ### One-time signing setup
 
 In **Settings > Secrets and variables > Actions**, add the four Android repository secrets before
@@ -229,26 +391,23 @@ when iOS is disabled, skipped, still running, or failing; iOS can add its downlo
 publishing jobs share a per-tag concurrency lock to avoid races when creating the release.
 The existing GitHub Pages workflow is unchanged.
 
-You can also start **Actions > Build Android release / Build iOS release > Run workflow** with
-an existing version tag, for example after correcting signing secrets. Android accepts either
-`0.1.0` or `v0.1.0` and resolves both to the existing `v0.1.0` tag; iOS requires the full
-`v0.1.0` tag. Neither workflow creates tags. For the initial release,
-create and push `v0.1.0` from the prepared release commit first:
+You can also start **Actions > Build Android release / Build iOS release > Run workflow**,
+for example after correcting signing secrets. Android asks for no version: it reads `package.json`
+from the selected branch's commit and checks that the npm manifests and native metadata agree.
+If the corresponding tag (for example `v0.2.0`) exists, Android builds that tag. Otherwise it builds
+the selected commit and creates the tag at that exact commit when publishing the successful build.
+No version bump is performed; prepare and commit version changes before running the workflow.
+iOS requires an existing full `v0.2.0` tag and never creates tags.
 
-```powershell
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-Pushing the tag starts the Android build automatically; a manual run is only needed to rebuild it.
-Selecting a branch in **Run workflow** does not replace the required tag.
+Pushing a tag starts the Android build automatically; manual Android runs also support releasing
+a prepared commit without first pushing a tag.
 Use **Re-run failed jobs**
 for transient failures. Retrying a workflow replaces only its own platform's package and checksum
 file, leaving the other platform's downloads intact. New app versions must still use a new version
 and tag. A newly created draft is published after that platform's upload succeeds; the other
 platform does not need to finish first.
 Build artifacts remain available in Actions for seven days; the GitHub Release assets are the
-persistent downloads. Neither workflow generates version-bump commits or pushes tags itself.
+persistent downloads. Neither workflow generates version-bump commits.
 
 ## Project Description
 

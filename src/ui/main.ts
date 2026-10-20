@@ -8,7 +8,11 @@ import { encodeGif, gifNonce } from '../render/gif';
 import { gifToFrames, MAX_GIF_STORE_BYTES } from '../render/gifDecode';
 import { ensureFont, renderMarquee, renderText } from '../render/text';
 import { deletePreset, listPresets, loadKv, loadSettings, restoreBackup, requestPersistence, saveKv, savePreset, saveSettings } from '../storage/db';
-import { DEFAULT_SETTINGS, DEFAULT_SPEED, isGroupPreset, validateContent, type Content, type Preset, type Settings } from '../storage/presets';
+import {
+  DEFAULT_SETTINGS, DEFAULT_SPEED, DEFAULT_STEP_SECONDS, MAX_SEQUENCE_STEPS, MAX_STEP_SECONDS, isGroupPreset, validateContent, validateSequenceSteps,
+  type Content, type Preset, type SequenceStep, type Settings, type SingleContent,
+} from '../storage/presets';
+import { composeSequence } from '../render/sequence';
 import { exportSelectedJson, mergeSharedPresets, parseSharedBackup, type ShareSelection } from '../storage/sharedBackup';
 import { MockTransport } from '../transport/mock';
 import { SPIKE_PROFILE, type TransportProfile } from '../transport/types';
@@ -19,7 +23,10 @@ import { applyGroupContent, applyImportedApproachSettings, getApproachSettings, 
 import { listenForShares, withShareLink } from '../approach/contentExchange';
 import { sendPreset, ShareState, type ShareKind, type ShareReceiver } from '../approach/presetShare';
 import { shareTextFile } from './shareFile';
+import { initTabs } from './tabs';
 import { GreetingUi } from '../scanner/ui';
+import { SoundUi } from '../sound/ui';
+import { UpdateUi } from '../update/ui';
 
 const $ = <T extends HTMLElement>(sel: string, root: ParentNode = document) => root.querySelector(sel) as T;
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -38,11 +45,16 @@ let previewTimer: ReturnType<typeof setTimeout> | undefined;
 const marqueeDelay = (speed: number) => Math.round(220 / speed);
 let sendNote = '';
 let brightnessNote = '';
+let brightnessTimer: ReturnType<typeof setTimeout> | undefined;
 let displayNote = '';
 let imageDataUrl = '';
 let renderSeq = 0;
 let savedCreateContent: Content | undefined;
+/** Connect tab sequence steps; kept as a draft while `sequenceOn` is false. */
+let sequence: SequenceStep[] = [];
+let sequenceOn = false;
 let scanner: GreetingUi | undefined;
+let sound: SoundUi | undefined;
 
 function profileFor(s: Settings): TransportProfile {
   return { ...SPIKE_PROFILE, chunkSize: s.chunkSize, interWriteDelayMs: s.interWriteDelayMs };
@@ -64,6 +76,7 @@ const sharedCap = () => native || useMock;
 const watched = new WeakSet<DeviceController>();
 function onPrimaryChange(p: PrimaryCap | null) {
   scanner?.stopCamera();
+  void sound?.stop();
   if (p) {
     controller = p.controller;
     deviceName = p.name;
@@ -92,6 +105,7 @@ function renderStatus() {
   if (prog && p) { prog.max = p.total; prog.value = p.sent; }
   updateButtons();
   scanner?.updateStatus();
+  sound?.updateStatus();
 }
 
 function updateButtons() {
@@ -103,7 +117,7 @@ function updateButtons() {
   set('btn-disconnect', s === 'Disconnected');
   set('btn-send', !ready || !lastImage);
   const help = document.getElementById('send-help');
-  if (help) help.textContent = controller.temporaryActive ? 'Wait for the QR greeting to finish before sending.'
+  if (help) help.textContent = controller.temporaryActive ? 'Wait for the current cap reaction to finish before sending.'
     : !ready ? 'Connect your hat above to send content. You can edit and preview offline.'
     : !lastImage ? 'Choose valid content to enable sending.' : 'Preview ready. Send it to your connected hat.';
   set('btn-test-color', !ready); set('btn-test-corner', !ready);
@@ -149,6 +163,7 @@ function renderConnect() {
 }
 
 function renderDeviceSettings() {
+  clearTimeout(brightnessTimer);
   const root = $('#settings-device');
   root.innerHTML = `
     <div class="card">
@@ -187,16 +202,15 @@ function renderDeviceSettings() {
   $('#btn-test-corner').onclick = () => sendImage(physical(cornerTest(...logicalDims())));
   $('#btn-disp-on').onclick = () => control('display', () => controller.setDisplay(true), (n) => (displayNote = n), 'dstate', 'On');
   $('#btn-disp-off').onclick = () => control('display', () => controller.setDisplay(false), (n) => (displayNote = n), 'dstate', 'Off');
-  let timer: ReturnType<typeof setTimeout>;
   const slider = $<HTMLInputElement>('#brightness');
   slider.oninput = () => {
     const level = Number(slider.value);
+    settings = { ...settings, brightness: level };
     $('#bval').textContent = String(level);
     $('#bstate').textContent = 'pending…';
-    clearTimeout(timer);
-    timer = setTimeout(async () => {
+    clearTimeout(brightnessTimer);
+    brightnessTimer = setTimeout(async () => {
       await control('brightness', () => controller.setBrightness(level), (n) => (brightnessNote = n), 'bstate', 'confirmed');
-      settings = { ...settings, brightness: level };
       persistSettings();
     }, 300);
   };
@@ -292,6 +306,15 @@ function renderCreate() {
         <label for="c-fit">Fit</label><select id="c-fit"><option>contain</option><option>cover</option><option>stretch</option></select>
         <p class="small">Transparent areas are filled with the background color.</p>
       </div>
+      <section class="sequence" aria-labelledby="c-seq-title">
+        <h3 id="c-seq-title">Sequence</h3>
+        <p class="small">Add the content above or saved presets as steps. The hat plays all steps in order, then loops.</p>
+        <ol id="c-seq-list" class="seq-list"></ol>
+        <div class="row"><button id="btn-seq-add">Add current content</button></div>
+        <div class="row"><select id="c-seq-preset" aria-label="Saved preset to add"></select><button id="btn-seq-add-preset">Add preset</button></div>
+        <label class="seq-toggle"><input type="checkbox" id="c-seq-on" /> Play sequence</label>
+        <p id="c-seq-help" class="small"></p>
+      </section>
       <p id="c-err" class="bad small"></p>
       <canvas id="preview" aria-label="Pixel preview"></canvas>
       <div class="row"><button id="btn-send" class="primary" disabled>Send to hat</button><button id="btn-cancel" class="danger" hidden>Cancel</button></div>
@@ -314,13 +337,93 @@ function renderCreate() {
   $('#btn-send').onclick = () => (lastFrames ? sendMarquee(lastFrames, lastDelays) : lastImage && sendImage(lastImage));
   $('#btn-cancel').onclick = () => controller.cancelUpload();
   $('#btn-save').onclick = savePresetClick;
+  $('#btn-seq-add').onclick = () => {
+    try { addSequenceSteps([{ content: editorContent(), seconds: DEFAULT_STEP_SECONDS }]); } catch (e) { $('#c-err').textContent = (e as Error).message; }
+  };
+  $('#btn-seq-add-preset').onclick = async () => {
+    const id = $<HTMLSelectElement>('#c-seq-preset').value;
+    try {
+      const p = (await listPresets()).find((x) => x.id === id);
+      if (!p || isGroupPreset(p)) throw new Error('Choose a saved content preset.');
+      addSequenceSteps(p.content.kind === 'sequence' ? structuredClone(p.content.steps) : [{ content: p.content, seconds: DEFAULT_STEP_SECONDS }]);
+    } catch (e) { $('#c-err').textContent = (e as Error).message; }
+  };
+  $<HTMLInputElement>('#c-seq-on').onchange = (e) => { sequenceOn = (e.target as HTMLInputElement).checked && sequence.length > 0; renderSequence(); void refreshPreview(); };
   syncKind();
   if (savedCreateContent) {
     if (savedCreateContent.kind === 'image') imageDataUrl = savedCreateContent.dataUrl;
     setCreateFrom(savedCreateContent);
   }
+  renderSequence();
+  void refreshSequencePresets();
   void refreshPreview();
   updateButtons();
+}
+
+// ---------- Sequence editor ---------------------------------------------------------
+
+const stepLabel = (c: SingleContent) => c.kind === 'text' ? `Text "${c.text}"` : c.kind === 'solid' ? `Solid ${c.color}` : 'Image';
+
+function renderSequence() {
+  const list = document.getElementById('c-seq-list');
+  if (!list) return;
+  const last = sequence.length - 1;
+  list.innerHTML = sequence.map((s, i) => `
+    <li data-index="${i}">
+      <span class="seq-label">${i + 1}. ${esc(stepLabel(s.content))}</span>
+      <label class="seq-seconds">Seconds <input type="number" data-act="sec" min="1" max="${MAX_STEP_SECONDS}" value="${s.seconds}" aria-label="Seconds for step ${i + 1}" /></label>
+      <button data-act="up" ${i === 0 ? 'disabled' : ''} aria-label="Move step ${i + 1} up">↑</button>
+      <button data-act="down" ${i === last ? 'disabled' : ''} aria-label="Move step ${i + 1} down">↓</button>
+      <button data-act="del" class="danger" aria-label="Remove step ${i + 1}">✕</button>
+    </li>`).join('') || '<li class="muted">No steps yet.</li>';
+  list.querySelectorAll<HTMLButtonElement>('button[data-act]').forEach((b) => b.onclick = () => {
+    const i = Number(b.closest('li')!.dataset.index);
+    const j = b.dataset.act === 'up' ? i - 1 : i + 1;
+    if (b.dataset.act === 'del') sequence.splice(i, 1);
+    else [sequence[i], sequence[j]] = [sequence[j]!, sequence[i]!];
+    sequenceChanged();
+  });
+  list.querySelectorAll<HTMLInputElement>('input[data-act=sec]').forEach((inp) => inp.onchange = () => {
+    const i = Number(inp.closest('li')!.dataset.index);
+    sequence[i]!.seconds = clampInt(inp.value, 1, MAX_STEP_SECONDS, sequence[i]!.seconds);
+    inp.value = String(sequence[i]!.seconds);
+    sequenceChanged();
+  });
+  const on = $<HTMLInputElement>('#c-seq-on');
+  on.checked = sequenceOn;
+  on.disabled = !sequence.length;
+  $<HTMLButtonElement>('#btn-seq-add').disabled = sequence.length >= MAX_SEQUENCE_STEPS;
+  $<HTMLButtonElement>('#btn-seq-add-preset').disabled = sequence.length >= MAX_SEQUENCE_STEPS || !$<HTMLSelectElement>('#c-seq-preset').value;
+  $('#c-seq-help').textContent = sequenceOn
+    ? `Playing ${sequence.length} step${sequence.length === 1 ? '' : 's'}: preview, send and save use all steps. Edits above compose the next step; add them with "Add current content".`
+    : sequence.length ? 'Sequence paused: preview and send use the content above.' : '';
+}
+
+function addSequenceSteps(steps: SequenceStep[]) {
+  if (sequence.length + steps.length > MAX_SEQUENCE_STEPS) throw new Error(`A sequence has at most ${MAX_SEQUENCE_STEPS} steps.`);
+  const next = validateSequenceSteps([...sequence, ...steps]);
+  sequence = next;
+  sequenceOn = true;
+  $('#c-err').textContent = '';
+  sequenceChanged();
+}
+
+function sequenceChanged() {
+  if (!sequence.length) sequenceOn = false;
+  void saveKv('createSequence', sequence).catch((e) => { $('#c-err').textContent = `Could not save the sequence: ${(e as Error).message}`; });
+  renderSequence();
+  void refreshPreview();
+}
+
+async function refreshSequencePresets() {
+  const select = document.getElementById('c-seq-preset') as HTMLSelectElement | null;
+  if (!select) return;
+  let presets: Preset[] = [];
+  try { presets = (await listPresets()).filter((p) => !isGroupPreset(p)); } catch { /* storage errors are shown elsewhere */ }
+  const keep = select.value;
+  select.innerHTML = presets.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('') || '<option value="" disabled selected>No saved presets</option>';
+  if (presets.some((p) => p.id === keep)) select.value = keep;
+  renderSequence();
 }
 
 function syncKind() {
@@ -334,6 +437,12 @@ function currentContent(): Content {
     if (!savedCreateContent) throw new Error('Choose content on the Connect tab first.');
     return savedCreateContent;
   }
+  if (sequenceOn && sequence.length) return { kind: 'sequence', steps: structuredClone(sequence) };
+  return editorContent();
+}
+
+/** The single content currently in the editor fields, ignoring the sequence. */
+function editorContent(): SingleContent {
   const k = $<HTMLSelectElement>('#c-kind').value;
   const fg = $<HTMLInputElement>('#c-fg').value, bg = $<HTMLInputElement>('#c-bg').value;
   if (k === 'solid') return { kind: 'solid', color: fg };
@@ -344,6 +453,17 @@ function currentContent(): Content {
 
 async function renderContent(c: Content): Promise<{ image: RgbImage; frames?: RgbImage[]; delays?: number[]; warnings: string[] }> {
   const [w, h] = logicalDims();
+  if (c.kind === 'sequence') {
+    const warnings: string[] = [];
+    const steps = [];
+    for (const [i, s] of c.steps.entries()) {
+      const r = await renderContent(s.content);
+      warnings.push(...r.warnings.map((w) => `Step ${i + 1}: ${w}`));
+      steps.push({ ...r, seconds: s.seconds });
+    }
+    const { frames, delays } = composeSequence(steps);
+    return frames.length > 1 ? { image: frames[0]!, frames, delays, warnings } : { image: frames[0]!, warnings };
+  }
   if (c.kind === 'solid') return { image: physical(solid(w, h, parseHexColor(c.color))), warnings: [] };
   if (c.kind === 'text') {
     await ensureFont();
@@ -445,12 +565,13 @@ async function savePresetClick() {
     $('#c-err').textContent = '';
     $<HTMLInputElement>('#c-name').value = '';
     sendNote = `Saved "${name}".`; setNote();
+    void refreshSequencePresets();
   } catch (e) { $('#c-err').textContent = (e as Error).message; }
 }
 
 // ---------- Presets view ---------------------------------------------------------
 
-const backupSelection: ShareSelection = { creations: true, approach: true, scan: true };
+const backupSelection: ShareSelection = { creations: true, approach: true, scan: true, settings: true, sound: true };
 
 async function renderPresets(message = '') {
   const root = $('#settings-presets');
@@ -462,18 +583,21 @@ async function renderPresets(message = '') {
     <div class="card">
       <h2>Presets</h2>
       ${err ? `<p class="bad">${esc(err)}</p>` : ''}
-      <ul class="list preset-list">${presets.map((p) => `<li data-id="${esc(p.id)}"><span>${esc(p.name)} <small class="muted">${isGroupPreset(p) ? `group content${approachAvailable ? '' : ' - requires the native app; kept for backup'}` : p.content.kind}</small></span><button data-act="load" ${isGroupPreset(p) && !approachAvailable ? 'disabled' : ''}>Load</button>${native && !useMock ? '<button data-act="share">Share</button>' : ''}<button data-act="del" class="danger">Delete</button></li>`).join('') || `<li class="muted">No presets yet. Save content on Connect${approachAvailable ? ' or a group preset on Approach' : ''} to find it here.</li>`}</ul>
+      <ul class="list preset-list">${presets.map((p) => `<li data-id="${esc(p.id)}"><span>${esc(p.name)} <small class="muted">${isGroupPreset(p) ? `group content${approachAvailable ? '' : ' - requires the native app; kept for backup'}` : p.content.kind === 'sequence' ? `sequence (${p.content.steps.length} step${p.content.steps.length === 1 ? '' : 's'})` : p.content.kind}</small></span><button data-act="load" ${isGroupPreset(p) && !approachAvailable ? 'disabled' : ''}>Load</button>${native && !useMock ? '<button data-act="share">Share</button>' : ''}<button data-act="del" class="danger">Delete</button></li>`).join('') || `<li class="muted">No presets yet. Save content on Connect${approachAvailable ? ' or a group preset on Approach' : ''} to find it here.</li>`}</ul>
       ${approachAvailable ? '' : '<p class="small">Nearby Approach detection and phone-to-phone BLE sharing require the Android or iOS app. Imported group presets remain available for backup and export.</p>'}
     </div>
     <div class="card">
       <h2>Backup</h2>
       <fieldset class="share-options">
         <legend>Include in shared file</legend>
-        <label><input type="checkbox" id="p-include-creations" ${backupSelection.creations ? 'checked' : ''} /> <span>Creations <small>Saved text, colors, images and GIFs (${presets.filter((p) => !isGroupPreset(p)).length})</small></span></label>
-        <label><input type="checkbox" id="p-include-approach" ${backupSelection.approach ? 'checked' : ''} /> <span>Approach settings <small>Saved group presets (${presets.filter(isGroupPreset).length}) and current group content</small></span></label>
-        <label><input type="checkbox" id="p-include-scan" ${backupSelection.scan ? 'checked' : ''} /> <span>Scan settings <small>Proximity thresholds, timing and QR greeting profiles</small></span></label>
+        <label><input type="checkbox" id="p-include-creations" ${backupSelection.creations ? 'checked' : ''} /> <span>Creations <small>Saved text, colors, images, GIFs and sequences (${presets.filter((p) => !isGroupPreset(p)).length}) and current Connect content and sequence</small></span></label>
+        <label><input type="checkbox" id="p-include-approach" ${backupSelection.approach ? 'checked' : ''} /> <span>Approach settings <small>Saved group presets (${presets.filter(isGroupPreset).length}), current group content, mode, beacon and nearby-cap detection</small></span></label>
+        <label><input type="checkbox" id="p-include-scan" ${backupSelection.scan ? 'checked' : ''} /> <span>Scan settings <small>Proximity thresholds, timing, QR profiles, current greeting, repetitions, speed and logging preference (not log contents)</small></span></label>
+        <label><input type="checkbox" id="p-include-settings" ${backupSelection.settings ? 'checked' : ''} /> <span>Display &amp; transport settings <small>Dimensions, brightness, rotation, mirroring and Bluetooth write settings</small></span></label>
+        <label><input type="checkbox" id="p-include-sound" ${backupSelection.sound ? 'checked' : ''} /> <span>Sound settings <small>Room sounds, phrases, language, pocket pause and reaction texts (not your voice sample or browser speech permission)</small></span></label>
       </fieldset>
       <p class="small">Choose at least one category. Importing replaces only the included categories; everything else stays unchanged.</p>
+      <p class="small">Importing Scan settings can enable scan logging. Phone identity, cap connections, permissions and running state are not shared.</p>
       <div class="row"><button id="btn-export">Share presets</button><label class="row"><span>Import</span><input id="p-import" type="file" accept="application/json,.json" /></label></div>
       <p id="p-msg" class="small" role="status">${esc(message)}</p>
       <p id="p-persist" class="small"></p>
@@ -498,12 +622,12 @@ async function renderPresets(message = '') {
   const shareOptions = $<HTMLFieldSetElement>('.share-options', root);
   let sharingBackup = false;
   const updateSelection = () => {
-    for (const key of ['creations', 'approach', 'scan'] as const) {
+    for (const key of ['creations', 'approach', 'scan', 'settings', 'sound'] as const) {
       backupSelection[key] = $<HTMLInputElement>(`#p-include-${key}`).checked;
     }
     exportButton.disabled = sharingBackup || !Object.values(backupSelection).some(Boolean);
   };
-  for (const key of ['creations', 'approach', 'scan'] as const) {
+  for (const key of ['creations', 'approach', 'scan', 'settings', 'sound'] as const) {
     $<HTMLInputElement>(`#p-include-${key}`).onchange = updateSelection;
   }
   updateSelection();
@@ -513,7 +637,13 @@ async function renderPresets(message = '') {
     updateSelection();
     try {
       const all = await listPresets();
-      const json = exportSelectedJson(all, getApproachSettings(), backupSelection, scanner?.exportProfiles());
+      const json = exportSelectedJson(all, getApproachSettings(), backupSelection,
+        backupSelection.scan ? scanner?.exportProfiles() : undefined, {
+          settings,
+          ...(backupSelection.creations ? { createContent: currentContent(), createSequence: sequence } : {}),
+          ...(backupSelection.scan ? scanner?.exportSettings() : {}),
+          ...(backupSelection.sound && sound ? { sound: sound.exportPreferences() } : {}),
+        });
       const shared = await shareTextFile('led-hat-presets.json', json, 'application/json', 'LED hat presets');
       $('#p-msg').textContent = shared ? 'Selected categories shared.' : '';
     } catch (e) { $('#p-msg').textContent = `Share failed: ${(e as Error).message}`; }
@@ -528,17 +658,33 @@ async function renderPresets(message = '') {
       const merged = mergeSharedPresets(await listPresets(), data);
       const currentApproach = getApproachSettings();
       const nextApproach = data.version === 2 && (data.approach || data.scan) ? {
-        ...currentApproach, ...data.scan, tiers: data.approach?.groups ?? currentApproach.tiers,
+        ...currentApproach, ...data.scan,
+        ...(data.approach?.mode !== undefined ? { mode: data.approach.mode } : {}),
+        ...(data.approach?.beacon !== undefined ? { beacon: data.approach.beacon } : {}),
+        ...(data.approach?.countNearbyCaps !== undefined ? { countNearbyCaps: data.approach.countNearbyCaps } : {}),
+        tiers: data.approach?.groups ?? currentApproach.tiers,
       } : undefined;
-      await restoreBackup(merged, data.version === 1 ? data.settings : undefined, nextApproach);
-      if (data.version === 1) settings = data.settings;
+      const scanSettings = scanner?.prepareImport(data);
+      const createContent = data.version === 2 ? data.createContent : undefined;
+      const createSequence = data.version === 2 ? data.createSequence : undefined;
+      const soundSettings = data.version === 2 && data.sound && sound ? sound.prepareImport(data.sound) : undefined;
+      if (soundSettings) await sound?.stop();
+      await restoreBackup(merged, data.settings, nextApproach, { ...scanSettings, createContent, createSequence, sound: soundSettings });
+      if (data.settings) settings = data.settings;
+      if (createSequence) { sequence = structuredClone(createSequence); renderSequence(); }
+      if (createContent) {
+        savedCreateContent = createContent;
+        if (createContent.kind === 'image') imageDataUrl = createContent.dataUrl;
+        setCreateFrom(createContent);
+      }
       if (nextApproach) applyImportedApproachSettings(nextApproach);
-      if (data.qrProfiles) await scanner?.importProfiles(data.qrProfiles);
+      if (scanSettings) scanner?.applyImportedSettings(scanSettings);
+      if (soundSettings) sound?.applyImported(soundSettings);
       renderDeviceSettings();
       await refreshPreview();
       await renderPresets(data.version === 1
         ? `Imported ${data.presets.length} presets and ${data.qrProfiles.profiles.length} QR profiles. Restart the connection to apply transport settings.`
-        : `Imported shared categories.${data.qrProfiles ? ` Imported ${data.qrProfiles.profiles.length} QR profiles.` : ''} Other presets and settings were kept.`);
+        : `Imported shared categories.${data.qrProfiles ? ` Imported ${data.qrProfiles.profiles.length} QR profiles.` : ''} Excluded presets and settings were kept.${data.settings ? ' Restart the connection to apply transport settings.' : ''}`);
     } catch (e) { $('#p-msg').textContent = `Import failed: ${(e as Error).message}`; }
   };
   const persisted = await navigator.storage?.persisted?.().catch(() => false);
@@ -679,6 +825,17 @@ function initShareReceiver() {
 }
 
 function setCreateFrom(c: Content) {
+  if (c.kind === 'sequence') {
+    sequence = structuredClone(c.steps);
+    sequenceOn = true;
+    void saveKv('createSequence', sequence).catch(() => undefined);
+    renderSequence();
+    c = c.steps[0]!.content;
+    if (c.kind === 'image') imageDataUrl = c.dataUrl;
+  } else if (sequenceOn) {
+    sequenceOn = false;
+    renderSequence();
+  }
   $<HTMLSelectElement>('#c-kind').value = c.kind;
   syncKind();
   if (c.kind === 'solid') $<HTMLInputElement>('#c-fg').value = c.color;
@@ -688,16 +845,13 @@ function setCreateFrom(c: Content) {
 
 // ---------- tabs, offline, install, updates ---------------------------------------
 
-function showTab(name: string) {
-  if (name === 'approach' && !approachAvailable) return;
-  document.querySelectorAll<HTMLButtonElement>('nav button').forEach((b) => {
-    const selected = b.dataset.tab === name;
-    b.setAttribute('aria-selected', String(selected));
-    b.tabIndex = selected ? 0 : -1;
-  });
-  for (const v of ['connect', 'approach', 'scan', 'settings']) $(`#view-${v}`).hidden = v !== name;
+let showTab: (name: string) => boolean;
+
+function onTabSelected(name: string) {
   if (name !== 'scan') scanner?.stopCamera();
+  if (name !== 'sound') void sound?.stop();
   if (name === 'settings') void renderPresets();
+  if (name === 'connect') void refreshSequencePresets();
   if (name === 'approach') renderApproach();
   window.scrollTo(0, 0);
 }
@@ -732,6 +886,20 @@ function setupPwa() {
     setTimeout(() => { const h = document.getElementById('install-help'); if (h && !deferred) h.hidden = false; }, 1500);
 }
 
+function setupAppUpdates() {
+  const platform = platformName();
+  const updates = new UpdateUi({
+    root: $('#settings-update'),
+    platform: native && !useMock && (platform === 'android' || platform === 'ios') ? platform : null,
+    currentVersion: __APP_VERSION__,
+    banner,
+    busy: () => controller.state === 'Uploading' || controller.temporaryActive,
+  });
+  updates.render();
+  // Let startup restore state first; the check is optional and must never delay the UI.
+  setTimeout(() => void updates.autoCheck(), 3000);
+}
+
 function approachContext(): Parameters<typeof initApproach>[0] {
   return {
     native, mock: useMock,
@@ -756,28 +924,27 @@ async function main() {
     const saved = await loadKv('createContent');
     if (saved !== undefined) savedCreateContent = validateContent(saved);
   } catch (e) { banner(`<b>Could not restore Connect content:</b> ${esc((e as Error).message)}`); }
+  try {
+    const draft = await loadKv('createSequence');
+    if (draft !== undefined) sequence = validateSequenceSteps(draft);
+  } catch (e) { banner(`<b>Could not restore the Connect sequence:</b> ${esc((e as Error).message)}`); }
   await initApproach(approachContext());
   initShareReceiver();
   renderConnect();
   renderDeviceSettings();
-  renderCreate();
-  scanner = new GreetingUi({ controller: () => controller, logicalDims, physical, marqueeDelay });
-  await scanner.init();
+  // Navigation must not wait for optional features to restore storage or query native capabilities.
   $('#tab-approach').hidden = !approachAvailable;
-  document.querySelectorAll<HTMLButtonElement>('nav button').forEach((b) => (b.onclick = () => showTab(b.dataset.tab!)));
-  $('#tab-bar').onkeydown = (event) => {
-    const tabs = [...document.querySelectorAll<HTMLButtonElement>('nav button:not([hidden])')];
-    const index = tabs.indexOf(document.activeElement as HTMLButtonElement);
-    if (index < 0) return;
-    const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length
-      : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length
-      : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1;
-    if (next < 0) return;
-    event.preventDefault();
-    showTab(tabs[next]!.dataset.tab!);
-    tabs[next]!.focus();
-  };
+  showTab = initTabs($('#tab-bar'), onTabSelected);
+  renderCreate();
   setupPwa();
+  setupAppUpdates();
   void requestPersistence();
+  scanner = new GreetingUi({ controller: () => controller, logicalDims, physical, marqueeDelay });
+  const scannerReady = scanner.init();
+  sound = new SoundUi({ controller: () => controller, logicalDims, physical });
+  await Promise.all([scannerReady, sound.init()]);
 }
-void main();
+void main().catch((error: unknown) => {
+  console.error('App initialization failed', error);
+  banner(`<b>App initialization failed:</b> ${esc(error instanceof Error ? error.message : String(error))}. Reload the app to try again.`);
+});

@@ -1,33 +1,49 @@
 import type { ApproachSettings } from '../approach/tiers';
-import { validateGreetingProfiles, type GreetingProfileState } from '../scanner/greeting';
+import { validatePreferences as validateSoundPreferences, type SoundPreferences } from '../sound/dictionary';
+import { validateGreeting, validateGreetingProfiles, type GreetingProfileState, type ScannerBackup } from '../scanner/greeting';
 import {
-  DEFAULT_SETTINGS, MAX_IMPORT_BYTES, MAX_PRESETS, isGroupPreset, parseImport, validateGroups,
-  type ContentPreset, type GroupContent, type GroupPreset, type Preset, type Settings,
+  DEFAULT_SETTINGS, MAX_IMPORT_BYTES, MAX_PRESETS, isGroupPreset, parseImport, validateContent, validateGroups, validateSequenceSteps, validateSettings,
+  type Content, type ContentPreset, type GroupContent, type GroupPreset, type Preset, type SequenceStep, type Settings,
 } from './presets';
 
-export interface ShareSelection { creations: boolean; approach: boolean; scan: boolean }
+export interface ShareSelection { creations: boolean; approach: boolean; scan: boolean; settings?: boolean; sound?: boolean }
 export type ScanSettings = Pick<ApproachSettings, 'enterDbm' | 'leaveDbm' | 'settleMs' | 'confirmMs' | 'staleMs'>;
-export interface SharedBackup {
+type ApproachOptions = Pick<ApproachSettings, 'mode' | 'beacon' | 'countNearbyCaps'>;
+export interface BackupFeatures extends ScannerBackup { settings?: Settings; createContent?: Content; createSequence?: SequenceStep[]; sound?: SoundPreferences }
+export interface SharedBackup extends BackupFeatures {
   app: 'iledcolor-app';
   version: 2;
   creations?: ContentPreset[];
-  approach?: { groups: GroupContent; presets: GroupPreset[] };
+  approach?: { groups: GroupContent; presets: GroupPreset[] } & Partial<ApproachOptions>;
   scan?: ScanSettings;
-  qrProfiles?: GreetingProfileState;
 }
 export type ImportedBackup = SharedBackup | { version: 1; settings: Settings; presets: Preset[]; qrProfiles: GreetingProfileState };
 
-export function exportSelectedJson(presets: Preset[], approach: ApproachSettings, selection: ShareSelection, qrProfiles?: GreetingProfileState): string {
-  if (!selection.creations && !selection.approach && !selection.scan) throw new Error('Choose at least one category to share.');
+export function exportSelectedJson(presets: Preset[], approach: ApproachSettings, selection: ShareSelection, qrProfiles?: GreetingProfileState, features: BackupFeatures = {}): string {
+  if (!selection.creations && !selection.approach && !selection.scan && !selection.settings && !selection.sound) throw new Error('Choose at least one category to share.');
+  if (selection.settings && !features.settings) throw new Error('Display and transport settings are unavailable.');
+  if (selection.sound && !features.sound) throw new Error('Sound settings are unavailable.');
   const file: SharedBackup = {
     app: 'iledcolor-app', version: 2,
     ...(selection.creations ? { creations: presets.filter((p): p is ContentPreset => !isGroupPreset(p)) } : {}),
-    ...(selection.approach ? { approach: { groups: approach.tiers, presets: presets.filter(isGroupPreset) } } : {}),
+    ...(selection.creations && features.createContent ? { createContent: validateContent(features.createContent) } : {}),
+    // A playing sequence already carries its steps in createContent; only a paused draft is stored separately.
+    ...(selection.creations && features.createSequence && features.createContent?.kind !== 'sequence'
+      ? { createSequence: validateSequenceSteps(features.createSequence) } : {}),
+    ...(selection.approach ? { approach: {
+      groups: approach.tiers, presets: presets.filter(isGroupPreset),
+      mode: approach.mode, beacon: approach.beacon, countNearbyCaps: approach.countNearbyCaps,
+    } } : {}),
     ...(selection.scan ? { scan: {
       enterDbm: approach.enterDbm, leaveDbm: approach.leaveDbm, settleMs: approach.settleMs,
       confirmMs: approach.confirmMs, staleMs: approach.staleMs,
     } } : {}),
     ...(selection.scan && qrProfiles ? { qrProfiles: validateGreetingProfiles(qrProfiles) } : {}),
+    ...(selection.scan && features.qrGreeting ? { qrGreeting: validateGreeting(features.qrGreeting) } : {}),
+    ...(selection.scan && features.qrScanLogging !== undefined ? { qrScanLogging: validateLogging(features.qrScanLogging) } : {}),
+    ...(selection.settings && features.settings ? { settings: validateSettings(features.settings) } : {}),
+    // Browser speech consent is a per-device privacy decision and is never shared.
+    ...(selection.sound && features.sound ? { sound: { ...validateSoundPreferences(features.sound), allowBrowserSpeech: false } } : {}),
   };
   if ((file.creations?.length ?? 0) + (file.approach?.presets.length ?? 0) > MAX_PRESETS) {
     throw new Error(`Share at most ${MAX_PRESETS} presets at a time. Choose fewer categories.`);
@@ -38,6 +54,28 @@ export function exportSelectedJson(presets: Preset[], approach: ApproachSettings
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+function validateLogging(raw: unknown): boolean {
+  if (typeof raw !== 'boolean') throw new Error('Invalid scan logging preference.');
+  return raw;
+}
+
+function validateCreateSequence(raw: unknown): SequenceStep[] {
+  try { return validateSequenceSteps(raw); } catch (e) { throw new Error(`Invalid Connect sequence: ${(e as Error).message}.`); }
+}
+
+function validateApproachOptions(raw: Record<string, unknown>): Partial<ApproachOptions> {
+  if ('mode' in raw && raw.mode !== 'p2p' && raw.mode !== 'hub') throw new Error('Invalid approach mode.');
+  for (const key of ['beacon', 'countNearbyCaps'] as const) {
+    if (key in raw && typeof raw[key] !== 'boolean') throw new Error(`Invalid approach setting: ${key}.`);
+  }
+  if (raw.mode === 'p2p' && raw.beacon === false) throw new Error('Phone-to-phone approach mode requires the beacon.');
+  return {
+    ...(raw.mode === 'p2p' || raw.mode === 'hub' ? { mode: raw.mode } : {}),
+    ...(typeof raw.beacon === 'boolean' ? { beacon: raw.beacon } : {}),
+    ...(typeof raw.countNearbyCaps === 'boolean' ? { countNearbyCaps: raw.countNearbyCaps } : {}),
+  };
+}
 
 function validateScan(raw: unknown): ScanSettings {
   if (!isObj(raw)) throw new Error('Invalid scan settings.');
@@ -63,8 +101,13 @@ export function parseSharedBackup(text: string): ImportedBackup {
   if (!isObj(raw) || raw.app !== 'iledcolor-app') throw new Error('Not an iledcolor-app export.');
   if (raw.version === 1) return { version: 1, ...parseImport(text) };
   if (raw.version !== 2) throw new Error(`Unsupported export version ${String(raw.version)}.`);
-  if (!('creations' in raw) && !('approach' in raw) && !('scan' in raw)) throw new Error('No shared categories in this file.');
-  if ('qrProfiles' in raw && !('scan' in raw)) throw new Error('QR profiles must be included with scan settings.');
+  if (!('creations' in raw) && !('approach' in raw) && !('scan' in raw) && !('settings' in raw) && !('sound' in raw)) throw new Error('No shared categories in this file.');
+  if (['qrProfiles', 'qrGreeting', 'qrScanLogging'].some((key) => key in raw) && !('scan' in raw))
+    throw new Error('QR profiles and greeting preferences must be included with scan settings.');
+  if ('createContent' in raw && !('creations' in raw)) throw new Error('Connect content must be included with creations.');
+  if ('createSequence' in raw && !('creations' in raw)) throw new Error('The Connect sequence must be included with creations.');
+  if ('createSequence' in raw && isObj(raw.createContent) && raw.createContent.kind === 'sequence')
+    throw new Error('The Connect sequence is stored twice.');
   // Reuse the strict preset validator, including the combined count and duplicate-ID checks.
   if ('creations' in raw && !Array.isArray(raw.creations)) throw new Error('Invalid creations list.');
   if ('approach' in raw && (!isObj(raw.approach) || !Array.isArray(raw.approach.presets))) throw new Error('Invalid approach settings.');
@@ -81,9 +124,15 @@ export function parseSharedBackup(text: string): ImportedBackup {
   return {
     app: 'iledcolor-app', version: 2,
     ...('creations' in raw ? { creations: contentPresets.filter((p): p is ContentPreset => !isGroupPreset(p)) } : {}),
-    ...(groups ? { approach: { groups, presets: savedGroups.filter(isGroupPreset) } } : {}),
+    ...(groups && approach ? { approach: { groups, presets: savedGroups.filter(isGroupPreset), ...validateApproachOptions(approach) } } : {}),
     ...('scan' in raw ? { scan: validateScan(raw.scan) } : {}),
     ...('qrProfiles' in raw ? { qrProfiles: validateGreetingProfiles(raw.qrProfiles) } : {}),
+    ...('qrGreeting' in raw ? { qrGreeting: validateGreeting(raw.qrGreeting) } : {}),
+    ...('qrScanLogging' in raw ? { qrScanLogging: validateLogging(raw.qrScanLogging) } : {}),
+    ...('createContent' in raw ? { createContent: validateContent(raw.createContent) } : {}),
+    ...('createSequence' in raw ? { createSequence: validateCreateSequence(raw.createSequence) } : {}),
+    ...('settings' in raw ? { settings: validateSettings(raw.settings) } : {}),
+    ...('sound' in raw ? { sound: validateSoundPreferences(raw.sound) } : {}),
   };
 }
 
