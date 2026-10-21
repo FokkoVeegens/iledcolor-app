@@ -1,4 +1,5 @@
 import type { ApproachSettings } from '../approach/tiers';
+import { DEFAULT_TEXT_FONT } from '../render/fonts';
 import { validatePreferences as validateSoundPreferences, type SoundPreferences } from '../sound/dictionary';
 import { validateGreeting, validateGreetingProfiles, type GreetingProfileState, type ScannerBackup } from '../scanner/greeting';
 import {
@@ -41,7 +42,9 @@ export function exportSelectedJson(presets: Preset[], approach: ApproachSettings
     ...(selection.scan && qrProfiles ? { qrProfiles: validateGreetingProfiles(qrProfiles) } : {}),
     ...(selection.scan && features.qrGreeting ? { qrGreeting: validateGreeting(features.qrGreeting) } : {}),
     ...(selection.scan && features.qrScanLogging !== undefined ? { qrScanLogging: validateLogging(features.qrScanLogging) } : {}),
-    ...(selection.settings && features.settings ? { settings: validateSettings(features.settings) } : {}),
+    ...(selection.settings && features.settings ? {
+      settings: validateSettings({ ...features.settings, textFont: features.settings.textFont ?? DEFAULT_TEXT_FONT }),
+    } : {}),
     // Browser speech consent is a per-device privacy decision and is never shared.
     ...(selection.sound && features.sound ? { sound: { ...validateSoundPreferences(features.sound), allowBrowserSpeech: false } } : {}),
   };

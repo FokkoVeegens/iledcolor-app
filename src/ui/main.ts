@@ -6,7 +6,8 @@ import { imageToMatrix, shrinkForStorage, type Fit } from '../render/image';
 import { cornerTest, drawPreview, parseHexColor, solid, transformImage } from '../render/matrix';
 import { encodeGif, gifNonce } from '../render/gif';
 import { gifToFrames, MAX_GIF_STORE_BYTES } from '../render/gifDecode';
-import { ensureFont, renderMarquee, renderText } from '../render/text';
+import { ensureFont, renderMarquee, renderText, setTextFont } from '../render/text';
+import { DEFAULT_TEXT_FONT, TEXT_FONTS, isTextFont } from '../render/fonts';
 import { deletePreset, listPresets, loadKv, loadSettings, restoreBackup, requestPersistence, saveKv, savePreset, saveSettings } from '../storage/db';
 import {
   DEFAULT_SETTINGS, DEFAULT_SPEED, DEFAULT_STEP_SECONDS, MAX_SEQUENCE_STEPS, MAX_STEP_SECONDS, isGroupPreset, validateContent, validateSequenceSteps,
@@ -19,7 +20,7 @@ import { SPIKE_PROFILE, type TransportProfile } from '../transport/types';
 import { bluetoothSupport, connectWebBluetooth } from '../transport/webBluetooth';
 import { chooseNativeCap, connectNativeCap, readCapRssi, startNativeScan, stopNativeScan } from '../transport/nativeBle';
 import { isNativeApp, platformName } from '../platform';
-import { applyGroupContent, applyImportedApproachSettings, getApproachSettings, approachRunning, connectAsPrimary, createContentChanged, disconnectPrimary, initApproach, renderApproach, sharePeers, shareIdentity, type PrimaryCap } from '../approach/ui';
+import { applyGroupContent, applyImportedApproachSettings, getApproachSettings, approachRunning, connectAsPrimary, createContentChanged, disconnectPrimary, initApproach, renderApproach, sharePeers, shareIdentity, textFontChanged, type PrimaryCap } from '../approach/ui';
 import { listenForShares, withShareLink } from '../approach/contentExchange';
 import { sendPreset, ShareState, type ShareKind, type ShareReceiver } from '../approach/presetShare';
 import { shareTextFile } from './shareFile';
@@ -168,6 +169,10 @@ function renderDeviceSettings() {
   root.innerHTML = `
     <div class="card">
       <h2>Display</h2>
+      <label for="s-font">LED text font</label>
+      <select id="s-font" aria-describedby="s-font-help">${TEXT_FONTS.map((f) => `<option value="${f.id}" ${f.id === (settings.textFont ?? DEFAULT_TEXT_FONT) ? 'selected' : ''}>${f.label}</option>`).join('')}</select>
+      <p id="s-font-help" class="small">Applies to all LED text: Connect, sequences, Approach, Scan greetings and Sound reactions. Tiny5 and Bitcount use crisp 2x pixel sizes; Bitcount fills all 16 rows. The other fonts use their native size. Letters have a one-pixel gap and emoji a two-pixel gap. Send again to update Connect content already on the hat.</p>
+      <canvas id="font-preview" width="32" height="16" role="img" aria-label="LED font sample: Hi!"></canvas>
       <label for="brightness">Dimming level: <b id="bval">${settings.brightness}</b> (0 = brightest, 10 = dimmest) <span id="bstate" class="small">${esc(brightnessNote)}</span></label>
       <input id="brightness" type="range" min="0" max="10" step="1" value="${settings.brightness}" />
       <p class="small">Mapping and "dimmest ≠ off" are unverified on this hat. Start dim for the first tests.</p>
@@ -202,6 +207,7 @@ function renderDeviceSettings() {
   $('#btn-test-corner').onclick = () => sendImage(physical(cornerTest(...logicalDims())));
   $('#btn-disp-on').onclick = () => control('display', () => controller.setDisplay(true), (n) => (displayNote = n), 'dstate', 'On');
   $('#btn-disp-off').onclick = () => control('display', () => controller.setDisplay(false), (n) => (displayNote = n), 'dstate', 'Off');
+  void refreshFontSample().catch((e: unknown) => banner(`<b>Could not preview LED text font:</b> ${esc(String(e))}`));
   const slider = $<HTMLInputElement>('#brightness');
   slider.oninput = () => {
     const level = Number(slider.value);
@@ -215,8 +221,12 @@ function renderDeviceSettings() {
     }, 300);
   };
   const readSettings = () => {
+    const font = $<HTMLSelectElement>('#s-font').value;
+    if (!isTextFont(font)) { banner('<b>Invalid LED text font.</b>'); return; }
+    const fontChanged = font !== (settings.textFont ?? DEFAULT_TEXT_FONT);
     settings = {
       ...settings,
+      textFont: font,
       chunkSize: clampInt($<HTMLInputElement>('#s-chunk').value, 1, 512, settings.chunkSize),
       interWriteDelayMs: clampInt($<HTMLInputElement>('#s-delay').value, 0, 1000, settings.interWriteDelayMs),
       transform: {
@@ -224,11 +234,22 @@ function renderDeviceSettings() {
         mirrorH: $<HTMLInputElement>('#s-mh').checked, mirrorV: $<HTMLInputElement>('#s-mv').checked,
       },
     };
+    setTextFont(font);
     persistSettings();
+    if (fontChanged) {
+      textFontChanged();
+      void refreshFontSample().catch((e: unknown) => banner(`<b>Could not preview LED text font:</b> ${esc(String(e))}`));
+    }
     void refreshPreview();
   };
-  root.querySelectorAll('#s-rot,#s-mh,#s-mv,#s-chunk,#s-delay').forEach((e) => e.addEventListener('change', readSettings));
+  root.querySelectorAll('#s-font,#s-rot,#s-mh,#s-mv,#s-chunk,#s-delay').forEach((e) => e.addEventListener('change', readSettings));
   renderStatus();
+}
+
+async function refreshFontSample() {
+  await ensureFont();
+  const canvas = document.getElementById('font-preview') as HTMLCanvasElement | null;
+  if (canvas) drawPreview(canvas, renderText('Hi!', 32, 16, [255, 255, 255], [0, 0, 0]).image);
 }
 
 const clampInt = (v: string, lo: number, hi: number, fallback: number) => {
@@ -593,7 +614,7 @@ async function renderPresets(message = '') {
         <label><input type="checkbox" id="p-include-creations" ${backupSelection.creations ? 'checked' : ''} /> <span>Creations <small>Saved text, colors, images, GIFs and sequences (${presets.filter((p) => !isGroupPreset(p)).length}) and current Connect content and sequence</small></span></label>
         <label><input type="checkbox" id="p-include-approach" ${backupSelection.approach ? 'checked' : ''} /> <span>Approach settings <small>Saved group presets (${presets.filter(isGroupPreset).length}), current group content, mode, beacon and nearby-cap detection</small></span></label>
         <label><input type="checkbox" id="p-include-scan" ${backupSelection.scan ? 'checked' : ''} /> <span>Scan settings <small>Proximity thresholds, timing, QR profiles, current greeting, repetitions, speed and logging preference (not log contents)</small></span></label>
-        <label><input type="checkbox" id="p-include-settings" ${backupSelection.settings ? 'checked' : ''} /> <span>Display &amp; transport settings <small>Dimensions, brightness, rotation, mirroring and Bluetooth write settings</small></span></label>
+        <label><input type="checkbox" id="p-include-settings" ${backupSelection.settings ? 'checked' : ''} /> <span>Display &amp; transport settings <small>LED text font, dimensions, brightness, rotation, mirroring and Bluetooth write settings</small></span></label>
         <label><input type="checkbox" id="p-include-sound" ${backupSelection.sound ? 'checked' : ''} /> <span>Sound settings <small>Room sounds, phrases, language, pocket pause and reaction texts (not your voice sample or browser speech permission)</small></span></label>
       </fieldset>
       <p class="small">Choose at least one category. Importing replaces only the included categories; everything else stays unchanged.</p>
@@ -668,9 +689,14 @@ async function renderPresets(message = '') {
       const createContent = data.version === 2 ? data.createContent : undefined;
       const createSequence = data.version === 2 ? data.createSequence : undefined;
       const soundSettings = data.version === 2 && data.sound && sound ? sound.prepareImport(data.sound) : undefined;
+      const nextSettings = data.settings ? { ...data.settings, textFont: data.settings.textFont ?? settings.textFont ?? DEFAULT_TEXT_FONT } : undefined;
       if (soundSettings) await sound?.stop();
-      await restoreBackup(merged, data.settings, nextApproach, { ...scanSettings, createContent, createSequence, sound: soundSettings });
-      if (data.settings) settings = data.settings;
+      await restoreBackup(merged, nextSettings, nextApproach, { ...scanSettings, createContent, createSequence, sound: soundSettings });
+      if (nextSettings) {
+        settings = nextSettings;
+        setTextFont(settings.textFont ?? DEFAULT_TEXT_FONT);
+        textFontChanged();
+      }
       if (createSequence) { sequence = structuredClone(createSequence); renderSequence(); }
       if (createContent) {
         savedCreateContent = createContent;
@@ -919,6 +945,7 @@ function approachContext(): Parameters<typeof initApproach>[0] {
 async function main() {
   try { settings = await loadSettings(); } catch (e) { settings = DEFAULT_SETTINGS; banner(`<b>Storage unavailable:</b> ${esc((e as Error).message)}. Presets cannot be saved.`); }
   settings = { ...settings, width: DEFAULT_SETTINGS.width, height: DEFAULT_SETTINGS.height }; // fixed 32x16 panel
+  setTextFont(settings.textFont ?? DEFAULT_TEXT_FONT);
   newController();
   try {
     const saved = await loadKv('createContent');
