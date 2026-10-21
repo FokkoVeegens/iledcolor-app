@@ -86,7 +86,7 @@ function glyphCache(font: typeof TEXT_FONTS[number]): Map<string, Glyph> {
 }
 
 /** One-line strip at natural width: hard-pixel ASCII text plus colour emoji. */
-function renderStrip(text: string, height: number, fg: Rgb, bg: Rgb): { strip: RgbImage; unsupported: string[] } {
+export function renderStrip(text: string, height: number, fg: Rgb, bg: Rgb): { strip: RgbImage; unsupported: string[] } {
   const { runs, unsupported } = splitRuns(text);
   const font = TEXT_FONTS.find((f) => f.id === textFont)!;
   const emojiPx = Math.max(8, height - 2);

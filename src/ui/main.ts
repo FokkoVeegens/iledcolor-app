@@ -28,6 +28,7 @@ import { initTabs } from './tabs';
 import { GreetingUi } from '../scanner/ui';
 import { SoundUi } from '../sound/ui';
 import { UpdateUi } from '../update/ui';
+import { GitHubUi } from '../github/ui';
 
 const $ = <T extends HTMLElement>(sel: string, root: ParentNode = document) => root.querySelector(sel) as T;
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -56,6 +57,7 @@ let sequence: SequenceStep[] = [];
 let sequenceOn = false;
 let scanner: GreetingUi | undefined;
 let sound: SoundUi | undefined;
+let github: GitHubUi | undefined;
 
 function profileFor(s: Settings): TransportProfile {
   return { ...SPIKE_PROFILE, chunkSize: s.chunkSize, interWriteDelayMs: s.interWriteDelayMs };
@@ -107,6 +109,7 @@ function renderStatus() {
   updateButtons();
   scanner?.updateStatus();
   sound?.updateStatus();
+  github?.updateStatus();
 }
 
 function updateButtons() {
@@ -157,7 +160,8 @@ function renderConnect() {
       <p class="small">Close other controller apps first. ${native ? `${platformName() === 'ios' ? 'iOS' : 'Android'} will ask for Bluetooth permission the first time you connect.` : 'Choose your hat in the browser Bluetooth picker. Connecting requires Web Bluetooth; editing and presets work offline.'}</p>
       <p class="small" id="install-help" hidden>To install: use your browser's Install app or Add to Home Screen option (in Safari, open the Share menu).</p>
     </div>
-    <div id="content-editor"></div>`;
+    <div id="content-editor"></div>
+    <div id="github-section"></div>`;
   $('#btn-connect').onclick = onConnect;
   $('#btn-disconnect').onclick = () => (sharedCap() ? disconnectPrimary() : controller.disconnect());
   renderStatus();
@@ -241,6 +245,7 @@ function renderDeviceSettings() {
       void refreshFontSample().catch((e: unknown) => banner(`<b>Could not preview LED text font:</b> ${esc(String(e))}`));
     }
     void refreshPreview();
+    github?.refreshPreview();
   };
   root.querySelectorAll('#s-font,#s-rot,#s-mh,#s-mv,#s-chunk,#s-delay').forEach((e) => e.addEventListener('change', readSettings));
   renderStatus();
@@ -611,7 +616,7 @@ async function renderPresets(message = '') {
       <h2>Backup</h2>
       <fieldset class="share-options">
         <legend>Include in shared file</legend>
-        <label><input type="checkbox" id="p-include-creations" ${backupSelection.creations ? 'checked' : ''} /> <span>Creations <small>Saved text, colors, images, GIFs and sequences (${presets.filter((p) => !isGroupPreset(p)).length}) and current Connect content and sequence</small></span></label>
+        <label><input type="checkbox" id="p-include-creations" ${backupSelection.creations ? 'checked' : ''} /> <span>Creations <small>Saved text, colors, images, GIFs and sequences (${presets.filter((p) => !isGroupPreset(p)).length}), current Connect content and sequence, and GitHub handle, prefix and postfix text</small></span></label>
         <label><input type="checkbox" id="p-include-approach" ${backupSelection.approach ? 'checked' : ''} /> <span>Approach settings <small>Saved group presets (${presets.filter(isGroupPreset).length}), current group content, mode, beacon and nearby-cap detection</small></span></label>
         <label><input type="checkbox" id="p-include-scan" ${backupSelection.scan ? 'checked' : ''} /> <span>Scan settings <small>Proximity thresholds, timing, QR profiles, current greeting, repetitions, speed and logging preference (not log contents)</small></span></label>
         <label><input type="checkbox" id="p-include-settings" ${backupSelection.settings ? 'checked' : ''} /> <span>Display &amp; transport settings <small>LED text font, dimensions, brightness, rotation, mirroring and Bluetooth write settings</small></span></label>
@@ -662,6 +667,7 @@ async function renderPresets(message = '') {
         backupSelection.scan ? scanner?.exportProfiles() : undefined, {
           settings,
           ...(backupSelection.creations ? { createContent: currentContent(), createSequence: sequence } : {}),
+          ...(backupSelection.creations && github ? { github: github.exportSettings() } : {}),
           ...(backupSelection.scan ? scanner?.exportSettings() : {}),
           ...(backupSelection.sound && sound ? { sound: sound.exportPreferences() } : {}),
         });
@@ -690,13 +696,15 @@ async function renderPresets(message = '') {
       const createSequence = data.version === 2 ? data.createSequence : undefined;
       const soundSettings = data.version === 2 && data.sound && sound ? sound.prepareImport(data.sound) : undefined;
       const nextSettings = data.settings ? { ...data.settings, textFont: data.settings.textFont ?? settings.textFont ?? DEFAULT_TEXT_FONT } : undefined;
+      const githubSettings = data.version === 2 && data.github ? github?.prepareImport(data.github) ?? data.github : undefined;
       if (soundSettings) await sound?.stop();
-      await restoreBackup(merged, nextSettings, nextApproach, { ...scanSettings, createContent, createSequence, sound: soundSettings });
+      await restoreBackup(merged, nextSettings, nextApproach, { ...scanSettings, createContent, createSequence, sound: soundSettings, github: githubSettings });
       if (nextSettings) {
         settings = nextSettings;
         setTextFont(settings.textFont ?? DEFAULT_TEXT_FONT);
         textFontChanged();
       }
+      if (githubSettings) github?.applyImported(githubSettings);
       if (createSequence) { sequence = structuredClone(createSequence); renderSequence(); }
       if (createContent) {
         savedCreateContent = createContent;
@@ -707,6 +715,7 @@ async function renderPresets(message = '') {
       if (scanSettings) scanner?.applyImportedSettings(scanSettings);
       if (soundSettings) sound?.applyImported(soundSettings);
       renderDeviceSettings();
+      github?.refreshPreview();
       await refreshPreview();
       await renderPresets(data.version === 1
         ? `Imported ${data.presets.length} presets and ${data.qrProfiles.profiles.length} QR profiles. Restart the connection to apply transport settings.`
@@ -969,7 +978,8 @@ async function main() {
   scanner = new GreetingUi({ controller: () => controller, logicalDims, physical, marqueeDelay });
   const scannerReady = scanner.init();
   sound = new SoundUi({ controller: () => controller, logicalDims, physical });
-  await Promise.all([scannerReady, sound.init()]);
+  github = new GitHubUi({ root: $('#github-section'), controller: () => controller, logicalDims, physical, frameDelayMs: marqueeDelay(DEFAULT_SPEED) });
+  await Promise.all([scannerReady, sound.init(), github.init()]);
 }
 void main().catch((error: unknown) => {
   console.error('App initialization failed', error);
